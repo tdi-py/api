@@ -1,0 +1,3 @@
+FROM alpine:latest
+COPY api.txt /app/api.txt
+CMD ["cat", "/app/api.txt"]
