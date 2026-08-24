@@ -208,7 +208,12 @@ jobs:
           )
           responses = berg.encode(model, stimulus, show_progress=True)
           md = model.metadata
-          corr = np.asarray(md["correlation_results"])
+          if "correlation_results" in md:
+              corr = np.asarray(md["correlation_results"])
+          elif "encoding_model" in md and "correlation_results" in md["encoding_model"]:
+              corr = np.asarray(md["encoding_model"]["correlation_results"])
+          else:
+              raise KeyError(f"correlation_results missing; metadata keys={list(md.keys())}")
 
           out_rows = []
           offset = 0
