@@ -32,7 +32,7 @@ jobs:
       - name: Download THINGS-fMRI ViT-B/32 weights
         run: |
           mkdir -p berg_dir/encoding_models/modality-fmri/train_dataset-things_fmri_1/model-vit_b_32
-          for s in 01 02 03; do
+          for s in 01; do
             aws s3 cp --no-sign-request --recursive \
               --exclude "*" --include "*sub-${s}.npy" \
               s3://brain-encoding-response-generator/encoding_models/modality-fmri/train_dataset-things_fmri_1/model-vit_b_32 \
@@ -52,7 +52,7 @@ jobs:
           PRODUCT_JS = "https://aureous.co/products/nuage-emerald.js"
           MODEL_ID = "fmri-things_fmri_1-vit_b_32"
           ROIS = ["V1","V2","V3","hV4","IT"]
-          SUBJECTS = [1,2,3]
+          SUBJECTS = [1]
           R_THRESHOLD = 0.10
 
           def fetch_product_image():
