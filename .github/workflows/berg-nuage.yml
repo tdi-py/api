@@ -1,0 +1,227 @@
+name: BERG Nuage Analysis
+
+on:
+  push:
+    branches:
+      - chatgpt-berg-nuage-20260824
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install BERG runtime
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy pyyaml scikit-learn scipy h5py tqdm Pillow torchextractor awscli requests pandas
+          pip install --no-deps "berg @ git+https://github.com/gifale95/BERG.git"
+
+      - name: Download THINGS-fMRI ViT-B/32 weights
+        run: |
+          mkdir -p berg_dir/encoding_models/modality-fmri/train_dataset-things_fmri_1/model-vit_b_32
+          for s in 01 02 03; do
+            aws s3 cp --no-sign-request --recursive \
+              --exclude "*" --include "*sub-${s}.npy" \
+              s3://brain-encoding-response-generator/encoding_models/modality-fmri/train_dataset-things_fmri_1/model-vit_b_32 \
+              berg_dir/encoding_models/modality-fmri/train_dataset-things_fmri_1/model-vit_b_32
+          done
+          find berg_dir -type f -printf "%p %k KB\n" | sort
+
+      - name: Run BERG on Aureous Nuage Emerald
+        run: |
+          cat > /tmp/analyze.py <<'PY'
+          import io, json, gc, os, requests
+          import numpy as np
+          import pandas as pd
+          from PIL import Image, ImageOps
+          from berg import BERG
+
+          PRODUCT_JS = "https://aureous.co/products/nuage-emerald.js"
+          MODEL_ID = "fmri-things_fmri_1-vit_b_32"
+          ROIS = ["V1","V2","V3","hV4","IT"]
+          SUBJECTS = [1,2,3]
+          R_THRESHOLD = 0.10
+
+          def fetch_product_image():
+              headers = {"User-Agent": "Mozilla/5.0"}
+              p = requests.get(PRODUCT_JS, headers=headers, timeout=30)
+              p.raise_for_status()
+              data = p.json()
+              urls = data.get("images", [])
+              if not urls:
+                  raise RuntimeError("No Shopify product images found")
+              rows = []
+              os.makedirs("out/candidates", exist_ok=True)
+              for i, u in enumerate(urls[:12]):
+                  if isinstance(u, dict):
+                      u = u.get("src") or u.get("url")
+                  if u.startswith("//"):
+                      u = "https:" + u
+                  r = requests.get(u, headers=headers, timeout=30)
+                  r.raise_for_status()
+                  img = Image.open(io.BytesIO(r.content)).convert("RGB")
+                  arr = np.asarray(img.resize((256,256))).astype(np.float32)
+                  R,G,B = arr[...,0],arr[...,1],arr[...,2]
+                  emerald = ((G > R*1.12) & (G > B*1.04) & (G > 35) & (G < 170)).mean()
+                  dark_green = ((G > R*1.08) & (G >= B) & ((R+G+B)/3 < 140)).mean()
+                  bright = (arr.mean(-1) > 205).mean()
+                  score = float(0.72*emerald + 0.28*dark_green - 0.08*bright)
+                  path = f"out/candidates/candidate_{i:02d}.jpg"
+                  img.thumbnail((1200,1200))
+                  img.save(path, quality=92)
+                  rows.append(dict(i=i,url=u,width=img.width,height=img.height,emerald=float(emerald),dark_green=float(dark_green),bright=float(bright),score=score,path=path))
+              rows.sort(key=lambda x:x["score"], reverse=True)
+              with open("out/product_candidates.json","w") as f:
+                  json.dump(rows,f,indent=2)
+              best = rows[0]
+              img = Image.open(best["path"]).convert("RGB")
+              print("SELECTED_IMAGE", json.dumps(best))
+              return img, best
+
+          def preserve_full_composition_square(img, size=512):
+              # Preserve full portrait composition; pad with border median color instead of cropping.
+              a = np.asarray(img)
+              border = np.concatenate([a[:max(1,a.shape[0]//40)].reshape(-1,3),
+                                       a[-max(1,a.shape[0]//40):].reshape(-1,3),
+                                       a[:, :max(1,a.shape[1]//40)].reshape(-1,3),
+                                       a[:, -max(1,a.shape[1]//40):].reshape(-1,3)], axis=0)
+              fill = tuple(np.median(border,axis=0).astype(np.uint8).tolist())
+              contained = ImageOps.contain(img, (size,size), method=Image.Resampling.LANCZOS)
+              canvas = Image.new("RGB",(size,size),fill)
+              x=(size-contained.width)//2; y=(size-contained.height)//2
+              canvas.paste(contained,(x,y))
+              return canvas, fill
+
+          def flat_control(size, fill):
+              return Image.new("RGB",(size,size),fill)
+
+          def arr_chw(img):
+              return np.asarray(img,dtype=np.uint8).transpose(2,0,1)
+
+          def get_corr(metadata):
+              if "correlation_results" in metadata:
+                  return np.asarray(metadata["correlation_results"])
+              if "encoding_model" in metadata and "correlation_results" in metadata["encoding_model"]:
+                  return np.asarray(metadata["encoding_model"]["correlation_results"])
+              raise KeyError(f"correlation_results missing; keys={list(metadata.keys())[:40]}")
+
+          os.makedirs("out", exist_ok=True)
+          poster, selected = fetch_product_image()
+          poster.save("out/selected_product_image.jpg",quality=95)
+          square, fill = preserve_full_composition_square(poster,512)
+          square.save("out/nuage_input_square.png")
+          control = flat_control(512,fill)
+          control.save("out/flat_emerald_control.png")
+          stimulus = np.stack([arr_chw(square),arr_chw(control)],axis=0)
+
+          print("INPUT_FILL_RGB", fill)
+          print("STIMULUS", stimulus.shape, stimulus.dtype, stimulus.min(), stimulus.max())
+
+          berg = BERG(berg_dir=os.path.abspath("berg_dir"))
+          out_rows=[]
+
+          for subject in SUBJECTS:
+              print("="*60, "\nSUBJECT",subject)
+              model = berg.get_encoding_model(MODEL_ID, subject=subject, device="cpu", selection={"roi":ROIS})
+              responses = berg.encode(model, stimulus, show_progress=False)
+              metadata = model.metadata
+              corr = get_corr(metadata)
+              offset=0
+              for roi in ROIS:
+                  idx=np.asarray(metadata["roi"][roi],dtype=int)
+                  n_total=len(idx)
+                  block=responses[:,offset:offset+n_total]
+                  offset += n_total
+                  reliable=(corr[idx] >= R_THRESHOLD)
+                  print(f"{roi}: {reliable.sum()}/{n_total} reliable")
+                  for stim_i,stim_name in enumerate(["nuage","flat_emerald"]):
+                      x=np.asarray(block[stim_i][reliable],dtype=float)
+                      pos=x[x>0]
+                      n_top=max(1,int(np.ceil(len(pos)*0.10))) if len(pos) else 0
+                      top10=float(np.sort(pos)[-n_top:].mean()) if n_top else float("nan")
+                      out_rows.append(dict(
+                          subject=subject,roi=roi,stimulus=stim_name,
+                          total_voxels=n_total,reliable_voxels=int(reliable.sum()),
+                          mean=float(x.mean()),std=float(x.std()),
+                          mean_abs=float(np.abs(x).mean()),
+                          positive_ratio=float((x>0).mean()),
+                          p25=float(np.percentile(x,25)),
+                          median=float(np.median(x)),
+                          p75=float(np.percentile(x,75)),
+                          p90=float(np.percentile(x,90)),
+                          max=float(x.max()),
+                          top10_positive=top10
+                      ))
+              if hasattr(model,"cleanup"):
+                  model.cleanup()
+              del model, responses
+              gc.collect()
+
+          df=pd.DataFrame(out_rows)
+          df.to_csv("out/berg_results.csv",index=False)
+
+          agg=(df.groupby(["stimulus","roi"],as_index=False)
+                 .agg(mean=("mean","mean"),
+                      mean_abs=("mean_abs","mean"),
+                      positive_ratio=("positive_ratio","mean"),
+                      top10_positive=("top10_positive","mean"),
+                      reliable_voxels=("reliable_voxels","sum")))
+          agg.to_csv("out/berg_aggregate.csv",index=False)
+
+          piv=agg.pivot(index="roi",columns="stimulus",values="top10_positive")
+          piv["delta_nuage_minus_flat"]=piv["nuage"]-piv["flat_emerald"]
+          piv.to_csv("out/top10_delta.csv")
+
+          overall_nuage=float(agg.loc[agg.stimulus=="nuage","top10_positive"].mean())
+          overall_flat=float(agg.loc[agg.stimulus=="flat_emerald","top10_positive"].mean())
+          overall_delta=overall_nuage-overall_flat
+
+          summary={
+              "selected_image":selected,
+              "fill_rgb":fill,
+              "r_threshold":R_THRESHOLD,
+              "subjects":SUBJECTS,
+              "rois":ROIS,
+              "overall_top10_nuage":overall_nuage,
+              "overall_top10_flat_emerald":overall_flat,
+              "overall_top10_delta":overall_delta
+          }
+          with open("out/summary.json","w") as f:
+              json.dump(summary,f,indent=2)
+
+          print("\n=== AGGREGATE ===")
+          print(agg.to_string(index=False))
+          print("\n=== TOP10 DELTA ===")
+          print(piv.to_string())
+          print("\n=== SUMMARY_JSON ===")
+          print(json.dumps(summary,indent=2))
+
+          # GitHub job summary
+          gsum=os.getenv("GITHUB_STEP_SUMMARY")
+          if gsum:
+              with open(gsum,"a") as f:
+                  f.write("# BERG — Aureous Nuage Emerald\n\n")
+                  f.write(f"Selected product image: {selected['url']}\n\n")
+                  f.write(f"Overall mean top10 positive — Nuage: **{overall_nuage:.4f}**  \\n")
+                  f.write(f"Overall mean top10 positive — flat emerald: **{overall_flat:.4f}**  \\n")
+                  f.write(f"Delta: **{overall_delta:+.4f}**\n\n")
+                  f.write(piv.round(4).to_markdown())
+          PY
+          python /tmp/analyze.py
+
+      - name: Upload BERG results
+        uses: actions/upload-artifact@v4
+        with:
+          name: berg-nuage-results
+          path: out/
+          retention-days: 7
