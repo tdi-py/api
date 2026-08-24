@@ -1,0 +1,170 @@
+name: EmoSet PerceptCLIP Top20
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  emoset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install emotion runtime
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install "transformers==4.45.2" "peft==0.14.0" huggingface_hub requests Pillow pandas
+
+      - name: Run EmoSet-trained PerceptCLIP on exact 20 products
+        run: |
+          cat > /tmp/emo.py <<'PY'
+          import os, io, json, importlib.util, math
+          import requests
+          import torch
+          import pandas as pd
+          from PIL import Image
+          from torchvision import transforms
+          from huggingface_hub import hf_hub_download
+
+          BASE = "https://aureous.co"
+          HANDLES = [
+            "super-moon-framed-canvas-art-sage-horizontal",
+            "framed-canvas-wall-art-blue",
+            "how-lucky-are-we-wall-art-print-horizontal-neutral",
+            "cyrus-trio-wall-art-prints",
+            "i-am-the-storm-square-neutral-wall-art-print",
+            "le-jardin-duo",
+            "i-am-the-storm-emerald-gold-wall-art",
+            "dream-on-framed-canvas-art-horizontal-beige",
+            "contemplating-yellow",
+            "contemplating-square-canvas-sage",
+            "how-lucky-are-we-framed-canvas-neutral-horizontal",
+            "storm-cloud-sky-blue-blush",
+            "blood-moon-wall-art-print",
+            "contemplating-square-canvas",
+            "i-am-the-storm-neutral-wall-art-print",
+            "above-the-clouds-trio-beige",
+            "skye-duo-beige-wall-art-prints",
+            "cranes-sapphire",
+            "cloud-party-trio-vintage-blue-wall-art",
+            "cranes-beige-and-gold",
+          ]
+          IDX2LABEL = {
+              0:"amusement", 1:"awe", 2:"contentment", 3:"excitement",
+              4:"anger", 5:"disgust", 6:"fear", 7:"sadness"
+          }
+          HEADERS={"User-Agent":"Mozilla/5.0"}
+          os.makedirs("out", exist_ok=True)
+          os.makedirs("out/images", exist_ok=True)
+
+          device=torch.device("cpu")
+          class_path=hf_hub_download(
+              repo_id="PerceptCLIP/PerceptCLIP_Emotions",
+              filename="modeling.py"
+          )
+          spec=importlib.util.spec_from_file_location("perceptclip_modeling", class_path)
+          modeling=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(modeling)
+          ModelClass=modeling.clip_lora_model
+          model=ModelClass().to(device)
+
+          model_path=hf_hub_download(
+              repo_id="PerceptCLIP/PerceptCLIP_Emotions",
+              filename="perceptCLIP_Emotions.pth"
+          )
+          state=torch.load(model_path, map_location=device, weights_only=False)
+          if isinstance(state, dict) and "state_dict" in state and not any(k.startswith("clip") or k.startswith("mlp") for k in state.keys()):
+              state=state["state_dict"]
+          result=model.load_state_dict(state, strict=False)
+          print("LOAD_STATE", result)
+          model.eval()
+
+          prep=transforms.Compose([
+              transforms.Resize(224),
+              transforms.CenterCrop((224,224)),
+              transforms.ToTensor(),
+              transforms.Normalize(
+                  mean=(0.48145466,0.4578275,0.40821073),
+                  std=(0.26862954,0.26130258,0.27577711)
+              )
+          ])
+
+          rows=[]
+          tensors=[]
+          recs=[]
+          for rank,handle in enumerate(HANDLES, start=1):
+              js=f"{BASE}/products/{handle}.js"
+              r=requests.get(js,headers=HEADERS,timeout=30)
+              r.raise_for_status()
+              p=r.json()
+              imgs=p.get("images") or []
+              if not imgs:
+                  raise RuntimeError(f"No images for {handle}")
+              u=imgs[0]
+              if isinstance(u,dict):
+                  u=u.get("src") or u.get("url")
+              if u.startswith("//"): u="https:"+u
+              ir=requests.get(u,headers=HEADERS,timeout=30)
+              ir.raise_for_status()
+              img=Image.open(io.BytesIO(ir.content)).convert("RGB")
+              img.save(f"out/images/{rank:02d}.jpg", quality=93)
+              tensors.append(prep(img))
+              recs.append((rank,p.get("title",handle),handle,u))
+
+          batch=torch.stack(tensors,dim=0).to(device)
+          all_probs=[]
+          with torch.no_grad():
+              for start in range(0,len(batch),2):
+                  logits=model(batch[start:start+2])
+                  if isinstance(logits,(tuple,list)):
+                      logits=logits[0]
+                  if hasattr(logits,"logits"):
+                      logits=logits.logits
+                  probs=torch.softmax(logits.float(),dim=1).cpu()
+                  all_probs.append(probs)
+          probs=torch.cat(all_probs,dim=0)
+
+          for i,(rank,title,handle,u) in enumerate(recs):
+              ps=probs[i].numpy().tolist()
+              order=sorted(range(8), key=lambda j: ps[j], reverse=True)
+              entropy=-sum(p*math.log(max(p,1e-12)) for p in ps)/math.log(8)
+              row={
+                  "rank":rank,"title":title,"handle":handle,"image_url":u,
+                  "dominant_emotion":IDX2LABEL[order[0]],
+                  "dominant_probability":ps[order[0]],
+                  "second_emotion":IDX2LABEL[order[1]],
+                  "second_probability":ps[order[1]],
+                  "positive_valence":sum(ps[:4]),
+                  "negative_valence":sum(ps[4:]),
+                  "emotion_entropy_norm":entropy,
+              }
+              for j,label in IDX2LABEL.items():
+                  row[label]=ps[j]
+              rows.append(row)
+              print("EMOTION",rank,title,row["dominant_emotion"],round(row["dominant_probability"],4),
+                    "second",row["second_emotion"],round(row["second_probability"],4),
+                    "positive",round(row["positive_valence"],4))
+
+          df=pd.DataFrame(rows)
+          df.to_csv("out/emoset_perceptclip_20.csv",index=False)
+          print("\n=== FULL ===")
+          print(df[["rank","title","dominant_emotion","dominant_probability","second_emotion","second_probability","positive_valence",
+                    "amusement","awe","contentment","excitement","anger","disgust","fear","sadness"]].round(4).to_string(index=False))
+          PY
+          python /tmp/emo.py
+
+      - name: Upload emotion outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emoset-perceptclip-top20
+          path: out/
+          retention-days: 7
